@@ -42,6 +42,23 @@ h1 {
   margin-bottom: 1rem;
 }
 
+.topbaractions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-shrink: 0;
+}
+
+.userinfo {
+  font-size: 0.9rem;
+  color: #555;
+  white-space: nowrap;
+}
+
+tr.selected {
+  background: #e3f2fd;
+}
+
 .row {
   display: flex;
   flex-wrap: wrap;

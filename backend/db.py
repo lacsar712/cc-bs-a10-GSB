@@ -22,6 +22,28 @@ CREATE TABLE IF NOT EXISTS strain_readings (
     processed_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS idx_strain_readings_status ON strain_readings (status, id);
+
+CREATE TABLE IF NOT EXISTS hoisting_snapshots (
+    id serial PRIMARY KEY,
+    window_name text NOT NULL UNIQUE,
+    frozen_by text NOT NULL,
+    frozen_at timestamptz NOT NULL DEFAULT now(),
+    item_count integer NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS hoisting_snapshot_items (
+    id serial PRIMARY KEY,
+    snapshot_id integer NOT NULL REFERENCES hoisting_snapshots(id) ON DELETE CASCADE,
+    reading_id integer NOT NULL,
+    seq integer NOT NULL,
+    span_code text NOT NULL,
+    microstrain double precision NOT NULL,
+    status_at_freeze text NOT NULL,
+    created_by text,
+    created_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_hoisting_snapshot_items_snapshot
+    ON hoisting_snapshot_items (snapshot_id, seq);
 """
 
 

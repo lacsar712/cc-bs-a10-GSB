@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 from passlib.context import CryptContext
+from psycopg.errors import UniqueViolation
 from sanic import Sanic
 from sanic.response import json as sanic_json
 
@@ -171,3 +172,166 @@ async def create_reading(request):
         },
         status=201,
     )
+
+
+def _serialize_snapshot(head, items):
+    return {
+        "id": head["id"],
+        "window_name": head["window_name"],
+        "frozen_by": head["frozen_by"],
+        "frozen_at": _iso(head["frozen_at"]),
+        "item_count": head["item_count"],
+        "items": [
+            {
+                "seq": it["seq"],
+                "reading_id": it["reading_id"],
+                "span_code": it["span_code"],
+                "microstrain": it["microstrain"],
+                "status_at_freeze": it["status_at_freeze"],
+                "created_by": it["created_by"],
+                "created_at": _iso(it["created_at"]),
+            }
+            for it in items
+        ],
+    }
+
+
+@app.post("/api/hoisting-snapshots")
+async def freeze_snapshot(request):
+    user = _require_user(request)
+    if not user:
+        return sanic_json({"detail": "未登录"}, status=401)
+    if user["role"] != "writer":
+        return sanic_json({"detail": "观察账号无权冻结吊装快照"}, status=403)
+    body = request.json or {}
+    window_name = str(body.get("window_name", "")).strip()
+    if not window_name:
+        return sanic_json({"detail": "吊装窗口名不能为空"}, status=400)
+
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            # 冻结动作与明细落库必须捆在同一个事务里：
+            # 任一环节失败整体回滚，不会留下没有明细的快照头。
+            try:
+                async with conn.transaction():
+                    await cur.execute(
+                        """
+                        INSERT INTO hoisting_snapshots (window_name, frozen_by)
+                        VALUES (%s, %s)
+                        RETURNING id, window_name, frozen_by, frozen_at, item_count
+                        """,
+                        (window_name, user["username"]),
+                    )
+                    head = await cur.fetchone()
+                    await cur.execute(
+                        """
+                        INSERT INTO hoisting_snapshot_items
+                            (snapshot_id, seq, reading_id, span_code, microstrain,
+                             status_at_freeze, created_by, created_at)
+                        SELECT %s,
+                               row_number() OVER (ORDER BY id),
+                               id, span_code, microstrain, status,
+                               created_by, created_at
+                        FROM strain_readings
+                        WHERE status IN ('pending', 'processing')
+                        ORDER BY id
+                        RETURNING id
+                        """,
+                        (head["id"],),
+                    )
+                    item_rows = await cur.fetchall()
+                    count = len(item_rows)
+                    if count == 0:
+                        # 无在途读数可冻结：抛错让事务整体回滚
+                        raise RuntimeError("no in-transit readings")
+                    await cur.execute(
+                        "UPDATE hoisting_snapshots SET item_count = %s WHERE id = %s",
+                        (count, head["id"]),
+                    )
+                    head["item_count"] = count
+                    await cur.execute(
+                        """
+                        SELECT seq, reading_id, span_code, microstrain,
+                               status_at_freeze, created_by, created_at
+                        FROM hoisting_snapshot_items
+                        WHERE snapshot_id = %s
+                        ORDER BY seq
+                        """,
+                        (head["id"],),
+                    )
+                    items = await cur.fetchall()
+            except UniqueViolation:
+                return sanic_json(
+                    {"detail": "该吊装窗口名已存在，请换一个窗口名"}, status=409
+                )
+            except RuntimeError as exc:
+                if exc.args and exc.args[0] == "no in-transit readings":
+                    return sanic_json(
+                        {"detail": "当前没有候审或处理中的在途读数，无法冻结"},
+                        status=400,
+                    )
+                raise
+
+    return sanic_json(_serialize_snapshot(head, items), status=201)
+
+
+@app.get("/api/hoisting-snapshots")
+async def list_snapshots(request):
+    if not _require_user(request):
+        return sanic_json({"detail": "未登录"}, status=401)
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, window_name, frozen_by, frozen_at, item_count
+                FROM hoisting_snapshots
+                ORDER BY id DESC
+                """
+            )
+            rows = await cur.fetchall()
+    return sanic_json(
+        [
+            {
+                "id": r["id"],
+                "window_name": r["window_name"],
+                "frozen_by": r["frozen_by"],
+                "frozen_at": _iso(r["frozen_at"]),
+                "item_count": r["item_count"],
+            }
+            for r in rows
+        ]
+    )
+
+
+@app.get("/api/hoisting-snapshots/<snapshot_id:int>")
+async def get_snapshot(request, snapshot_id: int):
+    if not _require_user(request):
+        return sanic_json({"detail": "未登录"}, status=401)
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, window_name, frozen_by, frozen_at, item_count
+                FROM hoisting_snapshots
+                WHERE id = %s
+                """,
+                (snapshot_id,),
+            )
+            head = await cur.fetchone()
+            if not head:
+                return sanic_json({"detail": "快照不存在"}, status=404)
+            await cur.execute(
+                """
+                SELECT seq, reading_id, span_code, microstrain,
+                       status_at_freeze, created_by, created_at
+                FROM hoisting_snapshot_items
+                WHERE snapshot_id = %s
+                ORDER BY seq
+                """,
+                (snapshot_id,),
+            )
+            items = await cur.fetchall()
+    return sanic_json(_serialize_snapshot(head, items))
